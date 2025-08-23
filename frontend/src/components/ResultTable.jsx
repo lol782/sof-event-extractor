@@ -2,11 +2,9 @@ import React, { useState } from 'react';
 import { format } from 'date-fns';
 import {
   CalendarIcon,
-  MapPinIcon,
   ClockIcon,
   DocumentTextIcon,
   ArrowDownTrayIcon,
-  EyeIcon,
   ChartBarIcon,
   ExclamationTriangleIcon
 } from '@heroicons/react/24/outline';
@@ -14,7 +12,6 @@ import {
 const ResultTable = ({ events, jobId, onExport, onViewTimeline }) => {
   const [sortField, setSortField] = useState('start');
   const [sortDirection, setSortDirection] = useState('asc');
-  const [filterLocation, setFilterLocation] = useState('');
   const [filterEvent, setFilterEvent] = useState('');
 
   if (!events || events.length === 0) {
@@ -70,18 +67,18 @@ const ResultTable = ({ events, jobId, onExport, onViewTimeline }) => {
         {/* Requirements Information */}
         <div className="card bg-blue-50 border-blue-200">
           <h4 className="font-semibold text-blue-900 mb-3">Required Document Format:</h4>
-          <ul className="space-y-2 text-blue-800 text-sm">
+                    <ul className="space-y-2 text-blue-800 text-sm">
             <li className="flex items-center space-x-2">
               <CalendarIcon className="h-4 w-4" />
               <span>Event timestamps (start and/or end times)</span>
             </li>
             <li className="flex items-center space-x-2">
-              <MapPinIcon className="h-4 w-4" />
-              <span>Location information (ports, coordinates)</span>
+              <DocumentTextIcon className="h-4 w-4" />
+              <span>Detailed event descriptions</span>
             </li>
             <li className="flex items-center space-x-2">
-              <DocumentTextIcon className="h-4 w-4" />
-              <span>Maritime event descriptions (incidents, arrivals, departures)</span>
+              <ClockIcon className="h-4 w-4" />
+              <span>Duration calculations between events</span>
             </li>
           </ul>
         </div>
@@ -89,22 +86,46 @@ const ResultTable = ({ events, jobId, onExport, onViewTimeline }) => {
     );
   }
 
+  // Normalize event data to handle backend field names
+  const normalizeEvents = (rawEvents) => {
+    return rawEvents.map(event => ({
+      event: event.Event || event.event || 'Unknown Event',
+      start: event.start_time_iso || event.start || null,
+      end: event.end_time_iso || event.end || null,
+      date: event.Date || event.date || null,
+      duration: event.Duration || event.duration || null,
+      location: event.location || null,
+      description: event.description || event.event || event.Event || 'No description',
+      laytime_counts: event.laytime_counts || false,
+      raw_line: event['Raw Line'] || event.raw_line || null,
+      filename: event.Filename || event.filename || null
+    }));
+  };
+
   // Sort and filter events
-  const processedEvents = events
+  const processedEvents = normalizeEvents(events)
     .filter(event => {
-      const locationMatch = !filterLocation ||
-        (event.location && event.location.toLowerCase().includes(filterLocation.toLowerCase()));
       const eventMatch = !filterEvent ||
-        event.event.toLowerCase().includes(filterEvent.toLowerCase());
-      return locationMatch && eventMatch;
+        (event.event && event.event.toLowerCase().includes(filterEvent.toLowerCase()));
+      return eventMatch;
     })
     .sort((a, b) => {
-      let aValue = a[sortField] || '';
-      let bValue = b[sortField] || '';
+      let aValue = a[sortField];
+      let bValue = b[sortField];
+
+      // Handle null/undefined values
+      if (!aValue && !bValue) return 0;
+      if (!aValue) return sortDirection === 'asc' ? 1 : -1;
+      if (!bValue) return sortDirection === 'asc' ? -1 : 1;
 
       if (sortField === 'start' || sortField === 'end') {
-        aValue = new Date(aValue || '1900-01-01');
-        bValue = new Date(bValue || '1900-01-01');
+        aValue = new Date(aValue);
+        bValue = new Date(bValue);
+        
+        // Handle invalid dates
+        if (isNaN(aValue) && isNaN(bValue)) return 0;
+        if (isNaN(aValue)) return sortDirection === 'asc' ? 1 : -1;
+        if (isNaN(bValue)) return sortDirection === 'asc' ? -1 : 1;
       }
 
       if (aValue < bValue) return sortDirection === 'asc' ? -1 : 1;
@@ -132,6 +153,11 @@ const ResultTable = ({ events, jobId, onExport, onViewTimeline }) => {
   };
 
   const getEventTypeColor = (eventType) => {
+    // Handle undefined or null eventType
+    if (!eventType || typeof eventType !== 'string') {
+      return 'bg-gray-100 text-gray-800';
+    }
+    
     const type = eventType.toLowerCase();
     if (type.includes('arrival') || type.includes('arrived')) {
       return 'bg-green-100 text-green-800';
@@ -191,19 +217,7 @@ const ResultTable = ({ events, jobId, onExport, onViewTimeline }) => {
 
       {/* Filters */}
       <div className="card">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-maritime-gray-700 mb-2">
-              Filter by Location
-            </label>
-            <input
-              type="text"
-              placeholder="Enter location..."
-              value={filterLocation}
-              onChange={(e) => setFilterLocation(e.target.value)}
-              className="input-field"
-            />
-          </div>
+        <div className="grid grid-cols-1 gap-4">
           <div>
             <label className="block text-sm font-medium text-maritime-gray-700 mb-2">
               Filter by Event Type
@@ -254,17 +268,6 @@ const ResultTable = ({ events, jobId, onExport, onViewTimeline }) => {
                   <div className="flex items-center space-x-1">
                     <span>End Time</span>
                     {sortField === 'end' && (
-                      <span>{sortDirection === 'asc' ? '↑' : '↓'}</span>
-                    )}
-                  </div>
-                </th>
-                <th
-                  className="px-6 py-3 text-left text-xs font-medium text-maritime-gray-500 uppercase tracking-wider cursor-pointer hover:text-maritime-navy"
-                  onClick={() => handleSort('location')}
-                >
-                  <div className="flex items-center space-x-1">
-                    <span>Location</span>
-                    {sortField === 'location' && (
                       <span>{sortDirection === 'asc' ? '↑' : '↓'}</span>
                     )}
                   </div>
@@ -320,12 +323,6 @@ const ResultTable = ({ events, jobId, onExport, onViewTimeline }) => {
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-maritime-gray-900">
                       <div className="flex items-center">
-                        <MapPinIcon className="h-4 w-4 text-maritime-gray-400 mr-2" />
-                        {event.location || 'Not specified'}
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-maritime-gray-900">
-                      <div className="flex items-center">
                         <ClockIcon className="h-4 w-4 text-maritime-gray-400 mr-2" />
                         {duration}
                       </div>
@@ -344,18 +341,12 @@ const ResultTable = ({ events, jobId, onExport, onViewTimeline }) => {
       </div>
 
       {/* Summary Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="card text-center">
           <div className="text-2xl font-bold text-maritime-navy">
             {processedEvents.length}
           </div>
           <div className="text-sm text-maritime-gray-600">Total Events</div>
-        </div>
-        <div className="card text-center">
-          <div className="text-2xl font-bold text-maritime-navy">
-            {new Set(processedEvents.map(e => e.location).filter(Boolean)).size}
-          </div>
-          <div className="text-sm text-maritime-gray-600">Unique Locations</div>
         </div>
         <div className="card text-center">
           <div className="text-2xl font-bold text-maritime-navy">
