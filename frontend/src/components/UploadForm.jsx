@@ -15,6 +15,7 @@ import {
 const UploadForm = () => {
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [useEnhancedProcessing, setUseEnhancedProcessing] = useState(false);
   const navigate = useNavigate();
   const { token } = useAuth();
 
@@ -49,6 +50,11 @@ const UploadForm = () => {
 
     const formData = new FormData();
     formData.append('file', file);
+    
+    // Add enhanced processing option
+    if (useEnhancedProcessing) {
+      formData.append('use_enhanced_processing', 'true');
+    }
 
     try {
       const response = await axios.post(`${API_BASE_URL}/api/upload`, formData, {
@@ -109,6 +115,27 @@ const UploadForm = () => {
           <p className="text-maritime-gray-600">
             Upload your maritime document to extract port events automatically
           </p>
+        </div>
+
+        {/* Enhanced Processing Option */}
+        <div className="mb-6 p-4 bg-blue-50 rounded-lg border border-blue-200">
+          <label className="flex items-center space-x-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={useEnhancedProcessing}
+              onChange={(e) => setUseEnhancedProcessing(e.target.checked)}
+              className="w-4 h-4 text-maritime-blue bg-gray-100 border-gray-300 rounded focus:ring-maritime-blue focus:ring-2"
+              disabled={uploading}
+            />
+            <div className="flex-1">
+              <span className="text-sm font-medium text-maritime-navy">
+                Enhanced Processing (Beta)
+              </span>
+              <p className="text-xs text-maritime-gray-600 mt-1">
+                Enable ultra-enhanced OCR with specialized clicked PDF processing for better accuracy on complex documents
+              </p>
+            </div>
+          </label>
         </div>
 
         {/* Upload Zone */}
