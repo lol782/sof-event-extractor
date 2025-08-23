@@ -3,7 +3,7 @@ SoF Event Extractor Backend API
 FastAPI application for processing maritime Statement of Facts documents with authentication
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Form, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer
@@ -17,12 +17,23 @@ from typing import List, Dict, Optional
 import pandas as pd
 from pathlib import Path
 
-# Import our utility modules
-from utils.pdf_parser import PDFParser
-from utils.docx_parser import DocxParser
-from utils.gpt_extractor import GPTExtractor
-from utils.gemini_extractor import GeminiEmbeddingExtractor
-# from utils.ocr_module import OCRProcessor  # Temporarily disabled
+# Import our new integrated modules
+try:
+    from utils.sof_pipeline import (
+        process_uploaded_files, 
+        extract_events_and_summary,
+        calculate_laytime,
+        process_clicked_pdf_enhanced,
+        LaytimeResult as SofLaytimeResult
+    )
+    print("✅ SoF Pipeline modules imported successfully")
+except ImportError as e:
+    print(f"⚠️ Warning: SoF Pipeline modules failed to import: {e}")
+    process_uploaded_files = None
+    extract_events_and_summary = None
+    calculate_laytime = None
+    process_clicked_pdf_enhanced = None
+    SofLaytimeResult = None
 
 # Import authentication modules
 from utils.auth import (
@@ -34,8 +45,17 @@ from utils.user_models import (
     User, UserCreate, UserLogin, UserResponse, Token,
     user_db
 )
+from models.sof_models import (
+    UploadRequest, EventData, VoyageSummary, LaytimeCalculation,
+    LaytimeResult, ProcessingResult, JobStatus as JobStatusModel
+)
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
@@ -60,26 +80,8 @@ RESULTS_DIR = Path("results")
 UPLOAD_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 
-# Initialize processors
-pdf_parser = PDFParser()
-docx_parser = DocxParser()
-
-# Initialize extractors with error handling
-try:
-    gpt_extractor = GPTExtractor()
-    print("✅ GPT Extractor initialized successfully")
-except Exception as e:
-    print(f"⚠️ Warning: GPT Extractor failed to initialize: {e}")
-    gpt_extractor = None
-
-try:
-    gemini_extractor = GeminiEmbeddingExtractor()
-    print("✅ Gemini Embedding Extractor initialized successfully")
-except Exception as e:
-    print(f"⚠️ Warning: Gemini Extractor failed to initialize: {e}")
-    gemini_extractor = None
-
-ocr_processor = None  # OCRProcessor()  # Temporarily disabled
+# No longer need these old processors - using integrated SoF pipeline
+print("🚀 Using integrated SoF Pipeline for document processing")
 
 # In-memory job storage (use database in production)
 jobs = {}
@@ -209,248 +211,226 @@ async def list_users(current_user: str = Depends(get_current_user)):
     # In production, add admin role check here
     return user_db.get_all_users()
 
-@app.post("/api/upload")
-async def upload_file(
-    background_tasks: BackgroundTasks, 
-    file: UploadFile = File(...),
-    current_user: str = Depends(get_current_user)
-):
+# Job status enumeration 
+class JobStatus:
+    PENDING = "pending"
+    PROCESSING = "processing" 
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+# Create a simple file-like object from upload
+class FileUpload:
+    def __init__(self, content: bytes, name: str):
+        self.content = content
+        self.name = name
+        
+    def read(self):
+        return self.content
+    
+    def getvalue(self):
+        return self.content
+
+async def process_document_with_sof_pipeline(job_id: str, file_path: Path, filename: str, use_enhanced_processing: bool = False):
     """
-    Upload and process a Statement of Facts document (requires authentication)
-    Supports PDF, DOCX, and image files
+    Process document using the new integrated SoF pipeline
     """
     try:
-        # Validate file type
-        allowed_extensions = {'.pdf', '.docx', '.doc', '.png', '.jpg', '.jpeg', '.tiff'}
-        file_extension = Path(file.filename).suffix.lower()
+        logger.info(f"🚀 Processing document {filename} with SoF Pipeline (enhanced: {use_enhanced_processing})")
         
-        if file_extension not in allowed_extensions:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Unsupported file type: {file_extension}. Supported: {', '.join(allowed_extensions)}"
-            )
+        # Get API key for Gemini
+        gemini_api_key = os.getenv("GOOGLE_API_KEY", "")
+        if not gemini_api_key:
+            logger.warning("⚠️ No Google API key found, processing will be limited")
         
-        # Generate unique job ID
-        job_id = str(uuid.uuid4())
+        # Read file content
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
         
-        # Save uploaded file
-        file_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+        # Create file upload object
+        file_upload = FileUpload(file_content, filename)
         
-        # Initialize job status with user info
-        jobs[job_id] = {
-            "status": JobStatus.PROCESSING,
-            "filename": file.filename,
-            "file_path": str(file_path),
-            "created_at": datetime.now().isoformat(),
-            "user": current_user,  # Track which user uploaded the file
-            "events": None,
-            "error": None
-        }
+        # Determine file type and process accordingly
+        file_extension = filename.lower().split('.')[-1]
         
-        # Start background processing
-        background_tasks.add_task(process_document, job_id, file_path, file_extension)
-        
-        return {
-            "job_id": job_id,
-            "status": JobStatus.PROCESSING,
-            "message": "Document uploaded successfully. Processing started."
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
-
-def validate_maritime_events(events: List[Dict], text: str) -> bool:
-    """
-    Validate if extracted events contain meaningful maritime information
-    
-    Args:
-        events: List of extracted events
-        text: Original document text for additional validation
-        
-    Returns:
-        bool: True if events contain valid maritime data, False otherwise
-    """
-    if not events:
-        return False
-    
-    # Check for maritime-specific keywords in the document
-    maritime_keywords = [
-        'vessel', 'ship', 'maritime', 'nautical', 'port', 'harbor', 'harbour',
-        'navigation', 'collision', 'grounding', 'incident', 'accident',
-        'latitude', 'longitude', 'coordinates', 'knots', 'bearing',
-        'crew', 'pilot', 'captain', 'bridge', 'engine', 'cargo',
-        'statement of facts', 'sof', 'marine', 'ocean', 'sea', 'berth',
-        'anchor', 'mooring', 'tug', 'arrival', 'departure', 'loading',
-        'discharge', 'docking', 'berthing', 'terminal', 'wharf'
-    ]
-    
-    text_lower = text.lower()
-    maritime_keyword_count = sum(1 for keyword in maritime_keywords if keyword in text_lower)
-    
-    # More lenient requirement: at least 1 maritime keyword OR proper timestamps
-    has_maritime_keywords = maritime_keyword_count >= 1
-    
-    # Check if events have meaningful content (not just system errors)
-    valid_events = 0
-    for event in events:
-        event_type = event.get('event', '').lower()
-        description = event.get('description', '').lower()
-        
-        # Skip system errors and configuration errors
-        if any(word in event_type for word in ['error', 'warning', 'system', 'configuration']):
-            continue
-        
-        # Count events with any timestamp or location information
-        start_time = event.get('start', '')
-        location = event.get('location', '')
-        
-        # Accept events with either timestamps or specific locations
-        has_timestamp = start_time and start_time not in ['Not Available', 'Unknown', '']
-        has_location = location and location not in ['Not Available', 'Unknown', '', 'Port']
-        
-        # Check for maritime event types (more inclusive)
-        maritime_event_types = [
-            'grounding', 'collision', 'fire', 'explosion', 'machinery',
-            'cargo', 'structural', 'oil spill', 'overboard', 'navigation',
-            'weather', 'port', 'incident', 'accident', 'damage',
-            'arrival', 'departure', 'berthing', 'unberthing', 'loading',
-            'discharge', 'pilot', 'anchor', 'mooring', 'tug'
-        ]
-        
-        has_maritime_content = any(
-            maritime_type in event_type or maritime_type in description
-            for maritime_type in maritime_event_types
-        )
-        
-        # Accept events that have either maritime content OR proper timestamps/locations
-        if has_maritime_content or has_timestamp or has_location:
-            valid_events += 1
-    
-    # More lenient validation: require either maritime keywords OR valid events
-    has_valid_content = has_maritime_keywords or valid_events > 0
-    
-    logger.info(f"Validation: keywords={maritime_keyword_count}, valid_events={valid_events}, result={has_valid_content}")
-    return has_valid_content
-
-async def process_document(job_id: str, file_path: Path, file_extension: str):
-    """
-    Background task to process the document and extract events
-    """
-    try:
-        # Extract text based on file type
-        if file_extension == '.pdf':
-            text = pdf_parser.extract_text(file_path)
-        elif file_extension in ['.docx', '.doc']:
-            text = docx_parser.extract_text(file_path)
-        elif file_extension in ['.png', '.jpg', '.jpeg', '.tiff']:
-            # text = await ocr_processor.extract_text_from_image(file_path)  # Temporarily disabled
-            raise Exception("OCR processing temporarily disabled. Please use PDF or DOCX files.")
+        if use_enhanced_processing and file_extension == 'pdf':
+            # Use specialized clicked PDF processing
+            logger.info("🎯 Using enhanced clicked PDF processing")
+            
+            if not gemini_api_key:
+                raise Exception("Enhanced processing requires Google API key")
+            
+            events_df, summary_data = process_clicked_pdf_enhanced(file_content, filename, gemini_api_key)
+            
         else:
-            raise Exception(f"Unsupported file type: {file_extension}")
-        
-        if not text or len(text.strip()) < 10:
-            raise Exception("No readable text found in document")
-        
-        # Extract events using available extractors (Gemini primary, GPT fallback)
-        events = []
-        
-        try:
-            # Try Gemini extraction first for better accuracy and speed
-            if gemini_extractor and gemini_extractor.gemini_available:
-                events = await gemini_extractor.extract_events_with_gemini(text)
-                logger.info(f"Gemini extraction completed: {len(events)} events found")
+            # Use standard SoF pipeline processing
+            logger.info("📄 Using standard SoF pipeline processing")
+            
+            # Process uploaded files
+            docs = process_uploaded_files([file_upload])
+            
+            if not docs:
+                raise Exception("No text could be extracted from the document")
+            
+            # Extract events and summary
+            if gemini_api_key:
+                events_df, summary_data = extract_events_and_summary(docs, gemini_api_key)
             else:
-                logger.info("Gemini extractor not available, skipping...")
-            
-            # If Gemini extraction yields few results or is unavailable, use GPT
-            if len(events) < 3 and gpt_extractor:
-                gpt_events = await gpt_extractor.extract_events(text)
-                logger.info(f"GPT extraction completed: {len(gpt_events)} events found")
-                
-                # Merge results, prioritizing Gemini events
-                combined_events = events + gpt_events
-                
-                # Remove duplicates based on event type and timing
-                unique_events = []
-                seen_events = set()
-                
-                for event in combined_events:
-                    event_key = f"{event.get('event', '').lower()}_{event.get('start', '')}"
-                    if event_key not in seen_events:
-                        unique_events.append(event)
-                        seen_events.add(event_key)
-                
-                events = unique_events[:10]  # Limit to top 10 events
-            
-            # Validate if the extracted events contain meaningful maritime data
-            if not validate_maritime_events(events, text):
-                logger.warning("No valid maritime events found in document")
-                events = [{
-                    "event": "Document Validation Warning",
-                    "description": "The uploaded document does not contain required maritime event details (event types, start/end times, or locations). Please ensure the document is a proper Statement of Facts or maritime incident report.",
-                    "start": "Not Available",
-                    "end": "Not Available", 
-                    "location": "Not Available",
-                    "severity": "Warning",
-                    "suggestion": "Upload a document containing maritime incidents with proper timestamps and event descriptions"
-                }]
-                
-        except Exception as extraction_error:
-            logger.warning(f"Primary extraction failed: {extraction_error}")
-            
-            # Final fallback: try GPT if available
-            if gpt_extractor:
-                try:
-                    logger.info("Using GPT as final fallback...")
-                    events = await gpt_extractor.extract_events(text)
-                except Exception as gpt_error:
-                    logger.error(f"GPT fallback also failed: {gpt_error}")
-                    # Return validation warning instead of mock events
-                    events = [{
-                        "event": "Document Validation Warning",
-                        "description": "The uploaded document does not contain recognizable maritime event details (event types, start/end times, or locations). Please ensure the document is a proper Statement of Facts or maritime incident report.",
-                        "start": "Not Available",
-                        "end": "Not Available", 
-                        "location": "Not Available",
-                        "severity": "Warning",
-                        "suggestion": "Upload a document containing maritime incidents with proper timestamps and event descriptions"
-                    }]
-            else:
-                # No extractors available
-                events = [{
-                    "event": "Document Validation Warning",
-                    "description": "The uploaded document does not contain recognizable maritime event details. Please ensure the document is a proper Statement of Facts or maritime incident report with timestamps and event descriptions.",
-                    "start": "Not Available",
-                    "end": "Not Available",
-                    "location": "Not Available",
-                    "severity": "Warning",
-                    "suggestion": "Upload a document containing maritime incidents with proper timestamps and event descriptions"
-                }]
+                # Fallback without Gemini
+                logger.warning("⚠️ No Gemini API key - using text extraction only")
+                events_df = pd.DataFrame()
+                summary_data = {}
+        
+        # Convert DataFrame to list of dictionaries for JSON serialization
+        if not events_df.empty:
+            events_list = events_df.to_dict('records')
+            # Convert any Timestamp objects to strings
+            for event in events_list:
+                for key, value in event.items():
+                    if pd.isna(value):
+                        event[key] = None
+                    elif hasattr(value, 'isoformat'):
+                        event[key] = value.isoformat()
+                    else:
+                        event[key] = str(value) if value is not None else None
+        else:
+            events_list = []
+            logger.warning("No events extracted from document")
         
         # Save results
+        result_data = {
+            "events": events_list,
+            "summary": summary_data,
+            "has_laytime_data": len(events_list) > 0 and any(event.get('laytime_counts') for event in events_list)
+        }
+        
         result_file = RESULTS_DIR / f"{job_id}_results.json"
         with open(result_file, 'w') as f:
-            json.dump(events, f, indent=2)
+            json.dump(result_data, f, indent=2, default=str)
         
         # Update job status
         jobs[job_id].update({
             "status": JobStatus.COMPLETED,
-            "events": events,
+            "events": events_list,
+            "summary": summary_data,
+            "has_laytime_data": result_data["has_laytime_data"],
             "processed_at": datetime.now().isoformat(),
             "result_file": str(result_file)
         })
         
+        logger.info(f"✅ Document {filename} processed successfully: {len(events_list)} events, summary: {bool(summary_data)}")
+        
     except Exception as e:
+        logger.error(f"💥 Document processing failed for {filename}: {e}")
         jobs[job_id].update({
             "status": JobStatus.FAILED,
             "error": str(e),
             "failed_at": datetime.now().isoformat()
         })
+
+@app.post("/api/upload")
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    use_enhanced_processing: bool = False,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Upload and process a maritime document using the integrated SoF pipeline
+    """
+    try:
+        # Validate file type
+        allowed_extensions = {'.pdf', '.docx', '.doc', '.txt', '.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.webp'}
+        file_extension = '.' + file.filename.lower().split('.')[-1]
+        
+        if file_extension not in allowed_extensions:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Unsupported file type: {file_extension}. Supported types: {', '.join(allowed_extensions)}"
+            )
+        
+        # Validate file size (10MB limit)
+        content = await file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File size exceeds 10MB limit")
+        
+        # Save uploaded file
+        job_id = str(uuid.uuid4())
+        file_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
+        
+        with open(file_path, 'wb') as f:
+            f.write(content)
+        
+        # Create job entry
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": JobStatus.PROCESSING,
+            "user": current_user,
+            "filename": file.filename,
+            "file_path": str(file_path),
+            "use_enhanced_processing": use_enhanced_processing,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Start background processing
+        background_tasks.add_task(
+            process_document_with_sof_pipeline, 
+            job_id, 
+            file_path, 
+            file.filename,
+            use_enhanced_processing
+        )
+        
+        logger.info(f"📤 Document upload initiated: {file.filename} (enhanced: {use_enhanced_processing})")
+        
+        return {
+            "message": "File uploaded successfully",
+            "job_id": job_id,
+            "filename": file.filename,
+            "enhanced_processing": use_enhanced_processing
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.post("/api/calculate-laytime")
+async def calculate_laytime_endpoint(
+    laytime_data: LaytimeCalculation,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Calculate laytime based on voyage summary and events data
+    """
+    try:
+        # Convert events data to DataFrame format expected by the pipeline
+        events_df = pd.DataFrame(laytime_data.events)
+        
+        if events_df.empty:
+            raise HTTPException(status_code=400, detail="No events provided for calculation")
+        
+        # Perform laytime calculation using the SoF pipeline
+        laytime_result = calculate_laytime(laytime_data.summary, events_df)
+        
+        # Convert result to API response format
+        result = {
+            "laytime_allowed_days": laytime_result.laytime_allowed_days,
+            "laytime_consumed_days": laytime_result.laytime_consumed_days,
+            "laytime_saved_days": laytime_result.laytime_saved_days,
+            "demurrage_due": laytime_result.demurrage_due,
+            "dispatch_due": laytime_result.dispatch_due,
+            "calculation_log": laytime_result.calculation_log,
+            "events_with_calculations": laytime_result.events_df.to_dict('records') if not laytime_result.events_df.empty else []
+        }
+        
+        logger.info(f"💰 Laytime calculated: allowed={laytime_result.laytime_allowed_days:.4f}, consumed={laytime_result.laytime_consumed_days:.4f}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Laytime calculation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Laytime calculation failed: {str(e)}")
 
 @app.get("/api/result/{job_id}")
 async def get_result(job_id: str, current_user: str = Depends(get_current_user)):
@@ -484,6 +464,8 @@ async def get_result(job_id: str, current_user: str = Depends(get_current_user))
             "status": JobStatus.COMPLETED,
             "filename": job["filename"],
             "events": job["events"],
+            "summary": job.get("summary", {}),
+            "has_laytime_data": job.get("has_laytime_data", False),
             "processed_at": job["processed_at"]
         }
 
@@ -509,7 +491,11 @@ async def get_status(job_id: str, current_user: str = Depends(get_current_user))
     }
 
 @app.post("/api/export/{job_id}")
-async def export_data(job_id: str, export_type: str = "csv"):
+async def export_data(
+    job_id: str, 
+    export_format: str = Query("csv", alias="type", description="Export format: csv or json"),
+    current_user: str = Depends(get_current_user)
+):
     """
     Export processed events as CSV or JSON
     """
@@ -517,6 +503,11 @@ async def export_data(job_id: str, export_type: str = "csv"):
         raise HTTPException(status_code=404, detail="Job not found")
     
     job = jobs[job_id]
+    
+    # Check if user owns this job
+    if job.get("user") != current_user:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
     if job["status"] != JobStatus.COMPLETED:
         raise HTTPException(status_code=400, detail="Job not completed yet")
     
@@ -524,8 +515,29 @@ async def export_data(job_id: str, export_type: str = "csv"):
     if not events:
         raise HTTPException(status_code=404, detail="No events found")
     
+    # Additional debugging to understand the exact structure
+    logger.info(f"🔍 DETAILED DEBUG - Raw events data:")
+    logger.info(f"🔍 Type: {type(events)}")
+    logger.info(f"🔍 Length: {len(events) if events else 0}")
+    if events and len(events) > 0:
+        logger.info(f"🔍 First element type: {type(events[0])}")
+        logger.info(f"🔍 First element: {events[0]}")
+        if isinstance(events[0], dict):
+            logger.info(f"🔍 First element keys: {list(events[0].keys())}")
+        elif isinstance(events[0], str):
+            logger.info(f"🔍 First element is STRING - this is the problem!")
+            logger.info(f"🔍 String content: {events[0][:200]}...")
+
     try:
-        if export_type.lower() == "csv":
+        # Debug: Print the structure of events data
+        logger.info(f"🔍 Debug - Events type: {type(events)}")
+        logger.info(f"🔍 Debug - Events length: {len(events) if events else 0}")
+        if events and len(events) > 0:
+            logger.info(f"🔍 Debug - First event type: {type(events[0])}")
+            logger.info(f"🔍 Debug - First event keys: {list(events[0].keys()) if isinstance(events[0], dict) else 'Not a dict'}")
+            logger.info(f"🔍 Debug - First event sample: {str(events[0])[:200]}...")
+        
+        if export_format.lower() == "csv":
             # Convert to DataFrame and export as CSV
             df = pd.DataFrame(events)
             csv_file = RESULTS_DIR / f"{job_id}_export.csv"
@@ -537,11 +549,57 @@ async def export_data(job_id: str, export_type: str = "csv"):
                 filename=f"sof_events_{job_id[:8]}.csv"
             )
         
-        elif export_type.lower() == "json":
-            # Export as JSON
+        elif export_format.lower() == "json":
+            # Export as JSON with proper datetime handling
+            import json
+            
+            class DateTimeEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if pd.isna(obj):
+                        return None
+                    if hasattr(obj, 'isoformat'):
+                        return obj.isoformat()
+                    return super().default(obj)
+            
+            # Clean the events data for JSON export
+            logger.info(f"📄 Creating JSON export for {len(events)} events")
+            logger.info(f"🔍 Debug - Events type: {type(events)}")
+            
+            if events and len(events) > 0:
+                logger.info(f"🔍 Debug - First event type: {type(events[0])}")
+                logger.info(f"🔍 Debug - First event sample: {str(events[0])[:200]}...")
+            
+            clean_events = []
+            for event in events:
+                clean_event = {}
+                for key, value in event.items():
+                    if pd.isna(value) or value is None or value == '':
+                        clean_event[key] = None
+                    elif isinstance(value, pd.Timestamp):
+                        clean_event[key] = value.strftime('%Y-%m-%d %H:%M:%S')
+                    elif isinstance(value, datetime):
+                        clean_event[key] = value.strftime('%Y-%m-%d %H:%M:%S')
+                    elif hasattr(value, 'isoformat'):
+                        clean_event[key] = value.isoformat()
+                    else:
+                        clean_event[key] = str(value)
+                clean_events.append(clean_event)
+            
+            logger.info(f"🔍 Debug - Clean events length: {len(clean_events)}")
+            if clean_events:
+                logger.info(f"🔍 Debug - First clean event: {str(clean_events[0])[:300]}...")
+            
             json_file = RESULTS_DIR / f"{job_id}_export.json"
-            with open(json_file, 'w') as f:
-                json.dump(events, f, indent=2)
+            logger.info(f"🔍 Debug - Writing to file: {json_file}")
+            
+            with open(json_file, 'w', encoding='utf-8') as f:
+                json.dump(clean_events, f, indent=2, cls=DateTimeEncoder, ensure_ascii=False)
+            
+            # Debug: Verify file content
+            logger.info(f"🔍 Debug - File size: {json_file.stat().st_size} bytes")
+            with open(json_file, 'r', encoding='utf-8') as f:
+                file_content = f.read(500)
+                logger.info(f"🔍 Debug - File content start: {file_content}")
             
             return FileResponse(
                 json_file,
@@ -550,7 +608,7 @@ async def export_data(job_id: str, export_type: str = "csv"):
             )
         
         else:
-            raise HTTPException(status_code=400, detail="Invalid export type. Use 'csv' or 'json'")
+            raise HTTPException(status_code=400, detail="Invalid export format. Use 'csv' or 'json'")
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
